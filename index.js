@@ -967,7 +967,12 @@ async function speakHandler(req, res) {
 
   console.log("SPEAK RESPONDING:", speech.slice(0, 140));
 
-  // Return JSON with every possible field name GHL voice AI might look for
+  /* ==========================================================
+     OLD JSON MULTI-FIELD RESPONSE (COMMENTED OUT)
+     This caused GPT-4o Voice runtime parsing issues.
+  ========================================================== */
+
+  /*
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   return res.status(200).json({
     success: true,
@@ -981,6 +986,15 @@ async function speakHandler(req, res) {
     answer: speech,
     content: speech,
   });
+  */
+
+  /* ==========================================================
+     NEW VOICE-SAFE RESPONSE
+     Returns RAW TEXT ONLY
+  ========================================================== */
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  return res.status(200).send(speech);
 }
 
 app.post("/ghl/mindbody/speak", speakHandler);
