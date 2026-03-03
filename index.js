@@ -63,6 +63,7 @@ if (SELF_URL) {
 const scheduleCache = new Map();
 const CACHE_TTL_MS = 15 * 60 * 1000;
 
+/*
 function getCached(dateStr) {
   const entry = scheduleCache.get(dateStr);
   if (!entry) return null;
@@ -70,6 +71,25 @@ function getCached(dateStr) {
     scheduleCache.delete(dateStr);
     return null;
   }
+  return entry;
+}
+*/
+// ==========================================================
+// LOCATION-AWARE CACHE
+// Cache key must include locationId + date
+// Prevents cross-location contamination
+// ==========================================================
+function getCached(dateStr, locationId) {
+  const key = `${locationId || "default"}_${dateStr}`;
+
+  const entry = scheduleCache.get(key);
+  if (!entry) return null;
+
+  if (Date.now() - entry.fetchedAt > CACHE_TTL_MS) {
+    scheduleCache.delete(key);
+    return null;
+  }
+
   return entry;
 }
 
@@ -84,8 +104,20 @@ async function warmCacheForDate(cfg, dateStr) {
     const slots = classes.slice(0, 12).map((c) => ({
       id: String(c.id), time: c.time, name: c.name, instructor: c.instructor || "", bookable: !!c.bookable,
     }));
-    scheduleCache.set(dateStr, { speech, slots, spokenDate, fetchedAt: Date.now() });
-    console.log(`cache warmed: ${dateStr} (${classes.length} classes)`);
+ // ==========================================================
+// Location-aware cache storage
+// Stores speech + slots using location + date as cache key
+// ==========================================================
+const key = `${cfg.locationId || "default"}_${dateStr}`;
+
+scheduleCache.set(key, {
+  speech,
+  slots,
+  spokenDate,
+  fetchedAt: Date.now(),
+});
+
+console.log(`cache warmed: ${key} (${classes.length} classes)`);
   } catch (e) {
     console.log(`cache warm failed ${dateStr}:`, e.message);
   }
@@ -185,7 +217,22 @@ function getMindbodyConfig() {
     requireEnv("MINDBODY_BASE_URL") || "https://api.mindbodyonline.com/public/v6";
   const tokenUsername = requireEnv("MINDBODY_TOKEN_USERNAME");
   const tokenPassword = requireEnv("MINDBODY_TOKEN_PASSWORD");
-  return { mode, apiKey, siteId, baseUrl, tokenUsername, tokenPassword };
+  // ==========================================================
+// OPTIONAL LOCATION FILTER SUPPORT
+// If MINDBODY_LOCATION_ID is set in Railway,
+// we will restrict class results to that location only.
+// ==========================================================
+const locationId = requireEnv("MINDBODY_LOCATION_ID");
+
+return {
+  mode,
+  apiKey,
+  siteId,
+  baseUrl,
+  tokenUsername,
+  tokenPassword,
+  locationId, // <-- added
+};
 }
 
 function getTodayISOInTZ(timeZone) {
@@ -360,7 +407,7 @@ function buildSpokenDateLabel(dateISO, timeZone) {
  */
 function buildScheduleSay(spokenDateLabel, classes) {
   const safeClasses = Array.isArray(classes) ? classes : [];
-  const top = safeClasses.slice(0, 3);
+  const top = safeClasses.slice(0, 7);
 
   if (!top.length) {
     return `I couldn't find any classes for ${spokenDateLabel}. Would you like a different date?`;
@@ -449,13 +496,19 @@ function normalizeMindbodyClasses(rawClasses) {
 
 async function fetchMindbodyScheduleForDate(cfg, dateISO) {
   const { start, end } = toMindbodyTimeWindow(dateISO);
+
   const url = new URL(`${cfg.baseUrl.replace(/\/$/, "")}/class/classes`);
   url.searchParams.set("StartDateTime", start);
   url.searchParams.set("EndDateTime", end);
 
+  // Location filter (safe)
+  if (cfg.locationId) {
+    url.searchParams.set("LocationId", cfg.locationId);
+  }
+
   const resp = await fetch(url.toString(), {
     method: "GET",
-    signal: AbortSignal.timeout(2500), // fail fast so GHL doesn't time out waiting
+    signal: AbortSignal.timeout(2500),
     headers: {
       "Api-Key": cfg.apiKey,
       "SiteId": cfg.siteId,
@@ -472,7 +525,14 @@ async function fetchMindbodyScheduleForDate(cfg, dateISO) {
     throw new Error(`Mindbody schedule error (${resp.status}): ${msg}`);
   }
 
-  const rawClasses = json?.Classes || json?.classes || json?.Items || json?.items || json || [];
+  const rawClasses =
+    json?.Classes ||
+    json?.classes ||
+    json?.Items ||
+    json?.items ||
+    json ||
+    [];
+
   return { raw: json, classes: normalizeMindbodyClasses(rawClasses) };
 }
 
@@ -735,7 +795,10 @@ async function mindbodyHandler(req, res) {
     // ---- LIVE ----
     try {
       // Check cache first for instant response
-      const cached = getCached(requestedDate);
+      // const cached = getCached(requestedDate);
+// Location-aware cache lookup
+const cached = getCached(requestedDate, cfg.locationId);
+
       if (cached) {
         console.log(`cache hit: ${requestedDate}`);
         return respondJSON(res, {
@@ -943,19 +1006,26 @@ async function speakHandler(req, res) {
     const requestedDate = resolved.requestedDate;
     const spokenDate = buildSpokenDateLabel(requestedDate, timezone);
 
-    const cached = getCached(requestedDate);
+    // const cached = getCached(requestedDate);
+// Location-aware cache lookup for voice endpoint
+const locationId = process.env.MINDBODY_LOCATION_ID || null;
+const cached = getCached(requestedDate, locationId);
     if (cached) {
       console.log(`speak cache hit: ${requestedDate}`);
       speech = cached.speech;
     } else {
       try {
-        const cfg = {
-          mode: process.env.MINDBODY_MODE || "live",
-          apiKey: process.env.MINDBODY_API_KEY || "",
-          siteId: process.env.MINDBODY_SITE_ID || "",
-          baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
-          timezone,
-        };
+      const cfg = {
+  mode: process.env.MINDBODY_MODE || "live",
+  apiKey: process.env.MINDBODY_API_KEY || "",
+  siteId: process.env.MINDBODY_SITE_ID || "",
+  baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
+
+  // Ensure voice endpoint uses same location filter as main handler
+  locationId: process.env.MINDBODY_LOCATION_ID || null,
+
+  timezone,
+};
         const schedule = await fetchMindbodyScheduleForDate(cfg, requestedDate);
         const classes = sortClassesByStartTime(schedule.classes);
         speech = buildScheduleSay(spokenDate, classes);
@@ -1004,12 +1074,16 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT} | buildId: ${BUILD_ID}`);
-  const warmCfg = {
-    mode: process.env.MINDBODY_MODE || "live",
-    apiKey: process.env.MINDBODY_API_KEY || "",
-    siteId: process.env.MINDBODY_SITE_ID || "",
-    baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
-    timezone: "America/Vancouver",
-  };
+ const warmCfg = {
+  mode: process.env.MINDBODY_MODE || "live",
+  apiKey: process.env.MINDBODY_API_KEY || "",
+  siteId: process.env.MINDBODY_SITE_ID || "",
+  baseUrl: process.env.MINDBODY_BASE_URL || "https://api.mindbodyonline.com/public/v6",
+
+  // Make cache warmer use same location as handlers
+  locationId: process.env.MINDBODY_LOCATION_ID || null,
+
+  timezone: "America/Vancouver",
+};
   startCacheWarmer(warmCfg);
 });
